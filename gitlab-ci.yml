@@ -1,0 +1,119 @@
+stages:
+  - show
+  - backup
+  - restore
+
+default:
+  tags:
+    - yc-shell
+  before_script:
+    - if [[ $DATABASE == "all" ]]; then export DATABASE="database_auth database_data database_serv"; fi
+
+variables:
+  RESTORE:
+    value: "no"
+    description: "'yes' чтобы восстановить базы"
+  BACKUP:
+    value: "no"
+    description: "'yes' чтобы забэкапить базы"
+  BACKUP_KONTUR: 
+    value: "develop"
+    description: "Название контура архив баз которого будет создан: develop qa experiments demo-generic demo-tion demo-sok demo-cushwake demo-sales demo-arrowcapital demo-gornostay demo-uzmolkom demo-hals"
+  RESTORE_FROM_KONTUR: 
+    value: "develop"
+    description: "Название контура архив баз которого будет использован для восстановления: develop qa experiments demo-generic demo-tion demo-sok demo-cushwake demo-sales demo-arrowcapital demo-gornostay demo-uzmolkom demo-hals\nДля очистки баз использовать 'none'"
+  RESTORE_TO_KONTUR:
+    value: "develop"
+    description: "Название контура куда будут восстановлены базы: develop qa experiments demo-generic demo-tion demo-sok demo-cushwake demo-sales demo-arrowcapital demo-gornostay demo-uzmolkom demo-hals"
+  DATABASE:
+    value: "all"
+    description: "Название ключа(ей) из Vault с именами баз (all для всех), если несколько то через пробел: database_auth database_data database_serv"
+  ARCHIVE_NUMBER:
+    value: "1"
+    description: "Номер архива начиная с последнего (последний - 1, предпоследний - 2 и т.д.)"
+  
+show_archive:
+  stage: show
+  only:
+    refs:
+      - web
+    variables:
+      - $BACKUP == "no" && $RESTORE == "no"
+  script:
+    - |
+      echo "---------------------------------------------------"
+      echo "Backup files for Kontur ${RESTORE_FROM_KONTUR}"
+      echo "                              "
+      ls -w1 -t /home/gitlab-runner/backup-db/${RESTORE_FROM_KONTUR} || echo "success"
+      echo "---------------------------------------------------"
+  
+backup_database:
+  stage: backup
+  only:
+    refs:
+      - web
+    variables:
+      - $BACKUP == "yes"
+  script:
+    - |
+      export VAULT_SKIP_VERIFY=true
+      export VAULT_ADDR=http://vault.service.yc.map:8200
+      for val in ${DATABASE[@]}; do
+        ssh -o LogLevel=QUIET -tt ubuntu@master-a -i ~/.ssh/id_ed25519 "sudo mkdir -p /mnt/vdb1/backup/${BACKUP_KONTUR}; sudo chmod 0777 /mnt/vdb1/backup/${BACKUP_KONTUR}; exit 0"
+        export VAULT_TOKEN="$(vault write -field=token auth/jwt/login role=database jwt=$CI_JOB_JWT)"
+        DB_NAME="$(vault kv get -field=${val} secrets/map/kontur/${BACKUP_KONTUR}/terraform)"
+        pgusername="$(vault kv get -field=dbuser secrets/map/kontur/${BACKUP_KONTUR}/terraform)"
+        pgpassword="$(vault kv get -field=dbpass secrets/map/kontur/${BACKUP_KONTUR}/terraform)"
+        pghost="$(vault kv get -field=dbhost secrets/map/kontur/${BACKUP_KONTUR}/terraform)"
+        pgport="$(vault kv get -field=dbport secrets/map/kontur/${BACKUP_KONTUR}/terraform)"
+        datebackup=$(date +%Y-%m-%d-%H-%M)
+        echo "Backup ${DB_NAME} to /home/gitlab-runner/backup-db/${BACKUP_KONTUR}/${DB_NAME}-${datebackup}.psql.gz"
+        PGPASSWORD="${pgpassword}" pg_dump --username=${pgusername} --dbname=postgresql://${pghost}:${pgport}/${DB_NAME} | gzip > "/home/gitlab-runner/backup-db/${BACKUP_KONTUR}/${DB_NAME}-${datebackup}.psql.gz"
+      done 
+  
+restore_database:
+  stage: restore
+  only:
+    refs:
+      - web
+    variables:
+      - $RESTORE == "yes"
+  script:
+    - |
+      export VAULT_SKIP_VERIFY=true
+      export VAULT_ADDR=http://vault.service.yc.map:8200
+      echo "Stopping Kontur ${RESTORE_TO_KONTUR} in Nomad cluster before restore database"
+      nomad job stop -namespace=${RESTORE_TO_KONTUR} magicairpro || echo ""
+      for val in ${DATABASE[@]}; do
+        export VAULT_TOKEN="$(vault write -field=token auth/jwt/login role=database jwt=$CI_JOB_JWT)"
+        DB_NAME_TO="$(vault kv get -field=${val} secrets/map/kontur/${RESTORE_TO_KONTUR}/terraform)"
+        pgusername="$(vault kv get -field=dbuser secrets/map/kontur/${RESTORE_TO_KONTUR}/terraform)"
+        pgpassword="$(vault kv get -field=dbpass secrets/map/kontur/${RESTORE_TO_KONTUR}/terraform)"
+        pghost="$(vault kv get -field=dbhost secrets/map/kontur/${RESTORE_TO_KONTUR}/terraform)"
+        pgport="$(vault kv get -field=dbport secrets/map/kontur/${RESTORE_TO_KONTUR}/terraform)"
+        cluster="$(vault kv get -field=cluster secrets/map/kontur/${RESTORE_TO_KONTUR}/terraform)"
+        echo "Deleting database ${DB_NAME_TO}"
+        yc managed-postgresql database delete ${DB_NAME_TO} --cluster-name ${cluster}
+        echo "Creating database ${DB_NAME_TO}"
+        yc managed-postgresql database create ${DB_NAME_TO} --cluster-name=${cluster} --owner=${pgusername} --lc-collate=en_US.UTF-8 --lc-type=en_US.UTF-8
+        if [[ ${RESTORE_FROM_KONTUR} != "none" ]]
+        then
+          userfrom="$(vault kv get -field=dbuser secrets/map/kontur/${RESTORE_FROM_KONTUR}/terraform)"
+          DB_NAME_FROM="$(vault kv get -field=${val} secrets/map/kontur/${RESTORE_FROM_KONTUR}/terraform)"
+          cd "/home/gitlab-runner/backup-db/${RESTORE_FROM_KONTUR}"
+          BACKUP_FILE=$(find -mindepth 1 -maxdepth 1 -type f -printf "%T+ %p\n" | sort -r | grep ${DB_NAME_FROM} | sed -n "${ARCHIVE_NUMBER},1p" | awk '{print $2}')
+          mkdir -p ./tmp
+          zcat "${BACKUP_FILE}" > "./tmp/backup.psql"
+          if [[ ${RESTORE_FROM_KONTUR} != ${RESTORE_TO_KONTUR} ]]
+          then
+            sed -i "s/${userfrom}/${pgusername}/g" "./tmp/backup.psql"
+          fi
+          sed -i "/GRANT ALL ON FUNCTION pg_catalog.pg_stat_reset() TO mdb_admin;/d" "./tmp/backup.psql"
+          sed -i "/ALTER DEFAULT PRIVILEGES FOR ROLE postgres IN SCHEMA public GRANT SELECT,INSERT,DELETE,UPDATE ON TABLES  TO/d" "./tmp/backup.psql"
+          echo "Restoring ${BACKUP_FILE} to ${DB_NAME_TO}"        
+          PGPASSWORD="${pgpassword}" psql -U ${pgusername} -d postgresql://${pghost}:${pgport}/${DB_NAME_TO} -f "./tmp/backup.psql"
+          rm -rf ./tmp
+        fi
+      done
+  after_script:
+    - rm -rf "/home/gitlab-runner/backup-db/${RESTORE_FROM_KONTUR}/tmp"

@@ -1,0 +1,4 @@
+10.128.0.27 test-master1
+10.128.0.28 test-master2
+10.131.0.14 test-worker1
+10.131.0.4 test-worker2
